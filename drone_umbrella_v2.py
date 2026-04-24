@@ -32,15 +32,24 @@ FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
 SIM_SIZE = 500
 
-SPEED_LR = 30
-SPEED_FB = 55
+SPEED_LR = 35
+SPEED_FB = 25
 SPEED_UD = 0
 SPEED_YAW = 0
 
-TARGET_AREA = 15000
-FB_DEADZONE = 0.02
-FB_MIN_SPEED = 22
+RC_INTERVAL = 0.05   # Send RC commands at 20Hz (Tello's max reliable rate)
+
+# TARGET_AREA: face pixel area at ideal hovering distance.
+# From screenshot, face area = 17424 at normal distance.
+TARGET_AREA = 17000
+FB_DEADZONE = 0.20   # Large deadzone so FB doesn't fire unless clearly too close/far
+FB_MIN_SPEED = 15
 LR_DEADZONE = 0.05
+
+# Laptop camera faces YOU, drone also faces YOU at takeoff.
+# So drone's right = YOUR left on screen → we must invert.
+# If drone still goes wrong way, flip this to False.
+LR_INVERT = True
 
 PERSON_SMOOTH = 0.4
 DRONE_SMOOTH = 0.15
@@ -129,12 +138,37 @@ class DroneController:
         self.state = state
         self.tello = None
         self.active = False
+        # Current RC values — updated by main loop, sent by RC thread at 20Hz
+        self._lr = 0
+        self._fb = 0
+        self._ud = 0
+        self._yaw = 0
+        self._rc_lock = threading.Lock()
+        self._rc_thread = None
+
+    def _rc_loop(self):
+        """Dedicated thread: sends RC commands to Tello at exactly 20Hz."""
+        while self.active and self.state.airborne:
+            with self._rc_lock:
+                lr, fb, ud, yaw = self._lr, self._fb, self._ud, self._yaw
+            try:
+                self.tello.send_rc_control(lr, fb, ud, yaw)
+            except Exception as e:
+                print(f"[DRONE] RC error: {e}")
+            time.sleep(RC_INTERVAL)
+
+    def set_rc(self, lr, fb, ud=0, yaw=0):
+        """Update desired RC values. The RC thread picks these up at 20Hz."""
+        with self._rc_lock:
+            self._lr = int(lr)
+            self._fb = int(fb)
+            self._ud = int(ud)
+            self._yaw = int(yaw)
 
     def connect(self):
         if not TELLO_AVAILABLE:
             print("[DRONE] djitellopy not installed — simulation only")
             return False
-
         try:
             print("[DRONE] Connecting to Tello...")
             self.tello = Tello()
@@ -160,6 +194,9 @@ class DroneController:
                     self.state.set(battery=self.tello.get_battery())
                 except Exception:
                     pass
+                # Start the dedicated RC thread now that we're airborne
+                self._rc_thread = threading.Thread(target=self._rc_loop, daemon=True)
+                self._rc_thread.start()
             except Exception as e:
                 print(f"[DRONE] Takeoff error: {e}")
         else:
@@ -169,7 +206,8 @@ class DroneController:
         if self.active and self.tello:
             try:
                 print("[DRONE] Landing...")
-                self.tello.send_rc_control(0, 0, 0, 0)
+                self.set_rc(0, 0, 0, 0)
+                time.sleep(0.1)
                 self.tello.land()
                 self.state.set(airborne=False, status_msg="Landed")
             except Exception as e:
@@ -180,7 +218,8 @@ class DroneController:
     def emergency_stop(self):
         try:
             if self.active and self.tello:
-                self.tello.send_rc_control(0, 0, 0, 0)
+                self.set_rc(0, 0, 0, 0)
+                time.sleep(0.1)
                 if self.state.airborne:
                     self.tello.land()
         except Exception:
@@ -190,24 +229,16 @@ class DroneController:
     def send_tracking_command(self, error_x: float, error_z: float):
         lr = scaled_lr_speed(error_x)
         fb = scaled_fb_speed(error_z)
-
-        if self.active and self.tello and self.state.airborne:
-            try:
-                self.tello.send_rc_control(lr, fb, SPEED_UD, SPEED_YAW)
-            except Exception as e:
-                print(f"[DRONE] RC error: {e}")
+        self.set_rc(lr, fb, SPEED_UD, SPEED_YAW)
 
     def stop_motion(self):
-        if self.active and self.tello and self.state.airborne:
-            try:
-                self.tello.send_rc_control(0, 0, 0, 0)
-            except Exception:
-                pass
+        self.set_rc(0, 0, 0, 0)
 
     def disconnect(self):
         if self.active and self.tello:
             try:
-                self.stop_motion()
+                self.set_rc(0, 0, 0, 0)
+                time.sleep(0.1)
                 if self.state.airborne:
                     self.tello.land()
                 self.tello.end()
@@ -380,6 +411,8 @@ def main():
     fps_count = 0
     smooth_x = 0.5
     smooth_y = 0.5
+    error_x = 0.0
+    error_z = 0.0
 
     while state.running:
         ret, frame = cap.read()
@@ -400,11 +433,12 @@ def main():
             smooth_x = smooth_x * (1 - PERSON_SMOOTH) + nx * PERSON_SMOOTH
             smooth_y = smooth_y * (1 - PERSON_SMOOTH) + ny * PERSON_SMOOTH
 
-            error_x = (smooth_x - 0.5) * 2.0
+            # LR direction: positive error_x = drone goes right
+            # If drone goes wrong direction, set LR_INVERT = True at top of file
+            raw_error_x = (smooth_x - 0.5) * 2.0
+            error_x = -raw_error_x if LR_INVERT else raw_error_x
             error_z = (TARGET_AREA - area) / TARGET_AREA
             error_z = float(np.clip(error_z, -1.5, 1.5))
-
-            print(f"[CORE] AREA={area} TARGET={TARGET_AREA} ERROR_Z={error_z:.3f}")
 
             if error_z > FB_DEADZONE:
                 depth_state = "TOO FAR"
@@ -430,17 +464,20 @@ def main():
                 cv2.circle(frame, (cx, cy), 6, CLR_BOX, -1)
                 put_text(frame, f"Face Area: {area}", (x, max(y - 8, 20)), CLR_BOX, 0.45)
 
-            if state.tracking:
-                lr = scaled_lr_speed(error_x)
-                fb = scaled_fb_speed(error_z)
-                print(f"[RC] lr={lr} fb={fb}  error_x={error_x:.3f} error_z={error_z:.3f}")
-                # Send to real drone only when airborne
-                if state.airborne:
+            # Send RC whenever airborne - tracking moves drone, paused sends keep-alive zeros
+            if state.airborne:
+                if state.tracking:
+                    lr = scaled_lr_speed(error_x)
+                    fb = scaled_fb_speed(error_z)
+                    print(f"[RC] lr={lr:+d} fb={fb:+d}  ex={error_x:.3f} ez={error_z:.3f}")
                     drone_ctrl.send_tracking_command(error_x, error_z)
-            elif state.airborne:
-                drone_ctrl.stop_motion()
+                else:
+                    # Keep-alive: drone hovers, won't auto-land
+                    drone_ctrl.stop_motion()
 
         else:
+            error_x = 0.0
+            error_z = 0.0
             state.set(
                 detected=False,
                 error_x=0.0,
@@ -449,7 +486,8 @@ def main():
                 depth_state="NO FACE",
                 status_msg="Searching..." if state.tracking else "Paused"
             )
-            if state.tracking and state.airborne:
+            # Keep-alive so Tello doesn't auto-land after 1s with no RC
+            if state.airborne:
                 drone_ctrl.stop_motion()
 
         # Simulation: drone smoothly follows person left/right (X axis)
@@ -490,7 +528,11 @@ def main():
                         print("[INFO] Could not connect. Staying in simulation mode.")
                         state.set(drone_mode=False)
                 drone_ctrl.takeoff()
+                # Auto-start tracking once airborne so drone moves immediately
+                state.set(tracking=True, status_msg="Tracking")
+                print("[INFO] Tracking auto-started after takeoff")
             else:
+                state.set(tracking=False)
                 drone_ctrl.land()
 
         elif key == ord('s'):
